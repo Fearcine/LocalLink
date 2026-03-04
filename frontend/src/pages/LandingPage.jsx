@@ -20,10 +20,10 @@ const steps = [
 ];
 
 const stats = [
-  { value: '5000+', label: 'Verified Freelancers' },
-  { value: '50+', label: 'Cities Covered' },
-  { value: '20K+', label: 'Happy Customers' },
-  { value: '4.8★', label: 'Average Rating' },
+  { value: 'Be the First ', label: 'Verified Freelancers' },
+  { value: 'Kolhapur ', label: 'Prioritiezed Cities' },
+  { value: ':)', label: 'Happy Customers' },
+  { value: 'For now its 0', label: 'Average Rating' },
 ];
 
 export default function LandingPage() {

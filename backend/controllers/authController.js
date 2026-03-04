@@ -1,217 +1,207 @@
 /**
- * Auth Controller
- * Handles OTP-based phone authentication
+ * authController.js
+ * Handles OTP send/verify for normal users and admins.
+ * Freelancer registration OTP is in freelancerController.js.
  */
 
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const { generateOTP, sendOTP } = require('../services/otpService');
+const jwt       = require('jsonwebtoken');
+const crypto    = require('crypto');
+const User      = require('../models/User');
+const Otp       = require('../models/Otp');
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+const OTP_TTL_MS       = 5 * 60 * 1000;   // 5 minutes
+const MAX_ATTEMPTS     = 5;
+const SEND_COOLDOWN_MS = 60 * 1000;       // 1 minute between sends
+const SEND_WINDOW_MS   = 60 * 60 * 1000; // 1 hour window
+const MAX_SENDS        = 5;              // max OTPs per hour per phone
+
+const signToken = (userId) =>
+  jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || '7d',
+  });
 
 /**
- * Generate JWT token
+ * Generate a 6-digit OTP.
+ * Uses crypto.randomInt for cryptographic randomness.
  */
-const signToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN || '7d'
-  });
+const generateOtp = () =>
+  String(crypto.randomInt(100000, 999999));
+
+/**
+ * Send (or mock-send) the OTP.
+ * DEV_OTP=true → print to console only.
+ */
+const dispatchOtp = async (phone, code) => {
+  if (process.env.DEV_OTP === 'true') {
+    console.log(`\n🔑  [DEV OTP]  Phone: ${phone}  |  Code: ${code}\n`);
+    return;
+  }
+  // Production: plug in Twilio / AWS SNS here
+  // const twilio = require('twilio')(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
+  // await twilio.messages.create({ body: `Your LocalLink code: ${code}`, from: process.env.TWILIO_FROM, to: phone });
+  throw new Error('SMS provider not configured. Set DEV_OTP=true for development.');
 };
 
-/**
- * @desc    Send OTP to phone number
- * @route   POST /api/auth/send-otp
- * @access  Public
- */
+// ─── POST /auth/send-otp ──────────────────────────────────────────────────────
+
 exports.sendOtp = async (req, res, next) => {
   try {
     const { phone } = req.body;
+    if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required.' });
 
-    if (!phone) {
-      return res.status(400).json({ success: false, message: 'Phone number is required' });
+    const now = Date.now();
+
+    // Find existing OTP record for rate-limit checks
+    let otpRecord = await Otp.findOne({ phone });
+
+    if (otpRecord) {
+      // Enforce cooldown between consecutive sends
+      if (
+        otpRecord.lastSentAt &&
+        now - otpRecord.lastSentAt.getTime() < SEND_COOLDOWN_MS
+      ) {
+        const wait = Math.ceil((SEND_COOLDOWN_MS - (now - otpRecord.lastSentAt.getTime())) / 1000);
+        return res.status(429).json({
+          success: false,
+          message: `Please wait ${wait}s before requesting another OTP.`,
+        });
+      }
+
+      // Enforce hourly send cap
+      const windowStart = otpRecord.sendWindowStart
+        ? otpRecord.sendWindowStart.getTime()
+        : 0;
+      const inWindow = now - windowStart < SEND_WINDOW_MS;
+      if (inWindow && otpRecord.sendCount >= MAX_SENDS) {
+        return res.status(429).json({
+          success: false,
+          message: 'Too many OTP requests. Try again in an hour.',
+        });
+      }
     }
 
-    const otpCode = process.env.MOCK_OTP === 'true'
-      ? (process.env.MOCK_OTP_CODE || '123456')
-      : generateOTP();
+    // Generate & hash OTP
+    const code    = generateOtp();
+    const otpHash = await Otp.hashOtp(code);
+    const expiresAt = new Date(now + OTP_TTL_MS);
 
-    const expiresAt = new Date(Date.now() + (parseInt(process.env.OTP_EXPIRES_IN_MINUTES) || 10) * 60 * 1000);
+    // Compute new send window / count
+    let sendCount       = 1;
+    let sendWindowStart = new Date(now);
+    if (otpRecord && otpRecord.sendWindowStart) {
+      const inWindow =
+        now - otpRecord.sendWindowStart.getTime() < SEND_WINDOW_MS;
+      sendCount       = inWindow ? otpRecord.sendCount + 1 : 1;
+      sendWindowStart = inWindow ? otpRecord.sendWindowStart : new Date(now);
+    }
 
-    // Upsert user with OTP
-    await User.findOneAndUpdate(
+    // Upsert OTP record
+    await Otp.findOneAndUpdate(
       { phone },
       {
-        phone,
-        otp: { code: otpCode, expiresAt, verified: false }
+        otpHash,
+        expiresAt,
+        attempts: 0,
+        lastSentAt: new Date(now),
+        sendCount,
+        sendWindowStart,
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, new: true }
     );
 
-    await sendOTP(phone, otpCode);
+    await dispatchOtp(phone, code);
 
-    res.json({
+    return res.json({
       success: true,
-      message: process.env.MOCK_OTP === 'true'
-        ? `OTP sent (MOCK mode - use: ${process.env.MOCK_OTP_CODE || '123456'})`
-        : 'OTP sent successfully',
-      mock: process.env.MOCK_OTP === 'true'
+      message:
+        process.env.DEV_OTP === 'true'
+          ? 'OTP printed to server console (DEV mode).'
+          : 'OTP sent successfully.',
+      dev: process.env.DEV_OTP === 'true' ? { code } : undefined,
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 };
 
-/**
- * @desc    Verify OTP and login/register
- * @route   POST /api/auth/verify-otp
- * @access  Public
- */
+// ─── POST /auth/verify-otp ────────────────────────────────────────────────────
+
 exports.verifyOtp = async (req, res, next) => {
   try {
     const { phone, otp } = req.body;
 
-    if (!phone || !otp) {
-      return res.status(400).json({ success: false, message: 'Phone and OTP are required' });
+    if (!phone || !otp)
+      return res.status(400).json({ success: false, message: 'Phone and OTP are required.' });
+
+    const otpRecord = await Otp.findOne({ phone });
+
+    if (!otpRecord)
+      return res.status(400).json({ success: false, message: 'No OTP found. Please request one first.' });
+
+    if (new Date() > otpRecord.expiresAt)
+      return res.status(400).json({ success: false, message: 'OTP has expired. Please request a new one.' });
+
+    if (otpRecord.attempts >= MAX_ATTEMPTS)
+      return res.status(429).json({ success: false, message: 'Too many incorrect attempts. Request a new OTP.' });
+
+    const valid = await otpRecord.verifyOtp(String(otp));
+
+    if (!valid) {
+      await Otp.findOneAndUpdate({ phone }, { $inc: { attempts: 1 } });
+      const remaining = MAX_ATTEMPTS - (otpRecord.attempts + 1);
+      return res.status(400).json({
+        success: false,
+        message: `Invalid OTP. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`,
+      });
     }
 
-    const user = await User.findOne({ phone });
+    // OTP valid — delete it
+    await Otp.deleteOne({ phone });
+
+    // Find or auto-create user (role: "user" — no profile completion needed)
+    let user = await User.findOne({ phone });
+    let isNew = false;
 
     if (!user) {
-      return res.status(400).json({ success: false, message: 'No OTP request found for this number' });
+      user  = await User.create({ phone, role: 'user' });
+      isNew = true;
     }
 
-    if (!user.otp || !user.otp.code) {
-      return res.status(400).json({ success: false, message: 'No OTP found. Please request a new one.' });
-    }
+    if (user.isBanned)
+      return res.status(403).json({ success: false, message: 'This account has been banned.' });
 
-    if (new Date() > user.otp.expiresAt) {
-      return res.status(400).json({ success: false, message: 'OTP has expired. Please request a new one.' });
-    }
-
-    if (user.otp.code !== otp.toString()) {
-      return res.status(400).json({ success: false, message: 'Invalid OTP' });
-    }
-
-    if (user.isBanned) {
-      return res.status(403).json({ success: false, message: 'Your account has been banned.' });
-    }
-
-    // Mark OTP verified and clear it
-    user.otp = { verified: true, code: null, expiresAt: null };
     user.lastLogin = new Date();
-    const isNewUser = !user.name;
     await user.save();
 
     const token = signToken(user._id);
 
-    res.json({
+    return res.json({
       success: true,
-      message: 'Login successful',
+      message: 'Login successful.',
       token,
       user: {
-        id: user._id,
-        name: user.name,
+        id:    user._id,
         phone: user.phone,
-        role: user.role,
-        avatar: user.avatar,
-        isNewUser
-      }
+        name:  user.name,
+        role:  user.role,
+        isNew,
+      },
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 };
 
-/**
- * @desc    Complete profile (new user)
- * @route   PUT /api/auth/complete-profile
- * @access  Private
- */
-exports.completeProfile = async (req, res, next) => {
-  try {
-    const { name, email, role, location } = req.body;
+// ─── GET /auth/me ─────────────────────────────────────────────────────────────
 
-    if (!name) {
-      return res.status(400).json({ success: false, message: 'Name is required' });
-    }
-
-    const allowedRoles = ['user', 'freelancer'];
-    const userRole = allowedRoles.includes(role) ? role : 'user';
-
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      { name, email, role: userRole, location },
-      { new: true, runValidators: true }
-    );
-
-    res.json({
-      success: true,
-      message: 'Profile completed',
-      user: {
-        id: user._id,
-        name: user.name,
-        phone: user.phone,
-        role: user.role,
-        avatar: user.avatar
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * @desc    Get current user
- * @route   GET /api/auth/me
- * @access  Private
- */
 exports.getMe = async (req, res, next) => {
   try {
     const user = await User.findById(req.user._id);
-
-    res.json({
-      success: true,
-      user
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * @desc    Admin login (secret-based)
- * @route   POST /api/auth/admin-login
- * @access  Public
- */
-exports.adminLogin = async (req, res, next) => {
-  try {
-    const { phone, adminSecret } = req.body;
-
-    if (adminSecret !== process.env.ADMIN_SECRET) {
-      return res.status(401).json({ success: false, message: 'Invalid admin credentials' });
-    }
-
-    let admin = await User.findOne({ phone, role: 'admin' });
-
-    if (!admin) {
-      admin = await User.create({
-        phone,
-        name: 'Admin',
-        role: 'admin'
-      });
-    }
-
-    const token = signToken(admin._id);
-
-    res.json({
-      success: true,
-      token,
-      user: {
-        id: admin._id,
-        name: admin.name,
-        phone: admin.phone,
-        role: admin.role
-      }
-    });
-  } catch (error) {
-    next(error);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    return res.json({ success: true, user });
+  } catch (err) {
+    next(err);
   }
 };

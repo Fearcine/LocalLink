@@ -1,100 +1,265 @@
 /**
- * Freelancer Controller
+ * freelancerController.js
+ * Handles freelancer registration (with OTP verification),
+ * profile retrieval, search, and contact relay.
  */
 
+const crypto     = require('crypto');
+const jwt        = require('jsonwebtoken');
+const bcrypt     = require('bcryptjs');
 const Freelancer = require('../models/Freelancer');
-const User = require('../models/User');
-const Review = require('../models/Review');
-const path = require('path');
+const User       = require('../models/User');
+const Otp        = require('../models/Otp');
+const Review     = require('../models/Review');
 
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+const OTP_TTL_MS   = 5 * 60 * 1000;
+const MAX_ATTEMPTS = 5;
+const SEND_COOLDOWN_MS = 60 * 1000;
+
+const signToken = (userId) =>
+  jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || '7d',
+  });
+
+const generateOtp = () => String(crypto.randomInt(100000, 999999));
+
+const dispatchOtp = async (phone, code) => {
+  if (process.env.DEV_OTP === 'true') {
+    console.log(`\n🔑  [DEV OTP — FREELANCER]  Phone: ${phone}  |  Code: ${code}\n`);
+    return;
+  }
+  throw new Error('SMS provider not configured. Set DEV_OTP=true for development.');
+};
+
+// ─── POST /freelancers/register ───────────────────────────────────────────────
 /**
- * @desc    Register as freelancer
- * @route   POST /api/freelancers/register
- * @access  Private
+ * Step 1: Accept freelancer application form + uploaded files.
+ * Saves a PENDING Freelancer document (phone not yet verified).
+ * Then issues an OTP to the provided phone.
  */
 exports.register = async (req, res, next) => {
   try {
-    // Check if already registered
-    const existing = await Freelancer.findOne({ user: req.user._id });
-    if (existing) {
-      return res.status(400).json({ success: false, message: 'You are already registered as a freelancer' });
-    }
-
     const {
+      name, phone,
       primaryCategory,
       secondaryCategories,
-      bio,
-      skills,
+      bio, skills,
       experience,
-      priceModel,
-      priceAmount,
-      priceConditions,
+      priceModel, priceAmount, priceConditions,
       location,
       serviceRadius,
-      availability
+      availability,
     } = req.body;
 
-    const profilePhoto = req.files?.profilePhoto?.[0]?.path;
-    const idProof = req.files?.idProof?.[0]?.path;
-
-    if (!idProof) {
-      return res.status(400).json({ success: false, message: 'ID proof is required' });
+    // ── Basic validation ──
+    if (!name || !phone || !primaryCategory || !priceAmount) {
+      return res.status(400).json({
+        success: false,
+        message: 'name, phone, primaryCategory and priceAmount are required.',
+      });
     }
 
-    const freelancer = await Freelancer.create({
-      user: req.user._id,
+    const profilePhoto = req.files?.profilePhoto?.[0]?.path || null;
+    const idProof      = req.files?.idProof?.[0]?.path;
+
+    if (!idProof) {
+      return res.status(400).json({ success: false, message: 'ID proof upload is required.' });
+    }
+
+    // ── Prevent duplicate applications ──
+    const existingFreelancer = await Freelancer.findOne({ phone });
+    if (existingFreelancer) {
+      if (existingFreelancer.phoneVerified) {
+        return res.status(409).json({
+          success: false,
+          message: 'A freelancer with this phone already exists.',
+        });
+      }
+      // Overwrite unverified draft with fresh data
+      await Freelancer.deleteOne({ phone });
+    }
+
+    // ── Parse JSON fields sent as strings (multipart/form-data) ──
+    const parseJson = (val, fallback) => {
+      if (!val) return fallback;
+      try { return JSON.parse(val); } catch { return fallback; }
+    };
+
+    const skillsArr      = Array.isArray(skills)
+      ? skills
+      : parseJson(skills, skills ? skills.split(',').map((s) => s.trim()) : []);
+    const secondaryCats  = parseJson(secondaryCategories, []);
+    const availObj       = parseJson(availability, {});
+    const locationObj    = parseJson(location, {});
+
+    await Freelancer.create({
+      name,
+      phone,
+      phoneVerified: false,
       primaryCategory,
-      secondaryCategories: secondaryCategories ? JSON.parse(secondaryCategories) : [],
-      bio,
-      skills: skills ? JSON.parse(skills) : [],
-      experience: parseInt(experience) || 0,
-      priceModel,
-      priceAmount: parseFloat(priceAmount),
-      priceConditions,
-      location: location ? JSON.parse(location) : undefined,
-      serviceRadius: parseInt(serviceRadius) || 5,
-      availability: availability ? JSON.parse(availability) : undefined,
+      secondaryCategories: secondaryCats.slice(0, 2),
+      bio:             bio || '',
+      skills:          skillsArr,
+      experience:      parseInt(experience) || 0,
+      priceModel:      priceModel || 'hourly',
+      priceAmount:     parseFloat(priceAmount),
+      priceConditions: priceConditions || '',
+      location:        locationObj,
+      serviceRadius:   parseInt(serviceRadius) || 5,
+      availability:    availObj,
       profilePhoto,
       idProof,
-      status: 'pending'
+      status: 'pending',
     });
 
-    // Update user role
-    await User.findByIdAndUpdate(req.user._id, { role: 'freelancer' });
+    // ── Send OTP ──
+    const now     = Date.now();
+    const code    = generateOtp();
+    const otpHash = await Otp.hashOtp(code);
 
-    res.status(201).json({
+    // Enforce cooldown
+    const existing = await Otp.findOne({ phone });
+    if (
+      existing?.lastSentAt &&
+      now - existing.lastSentAt.getTime() < SEND_COOLDOWN_MS
+    ) {
+      const wait = Math.ceil(
+        (SEND_COOLDOWN_MS - (now - existing.lastSentAt.getTime())) / 1000
+      );
+      return res.status(429).json({
+        success: false,
+        message: `Please wait ${wait}s before requesting another OTP.`,
+      });
+    }
+
+    await Otp.findOneAndUpdate(
+      { phone },
+      { otpHash, expiresAt: new Date(now + OTP_TTL_MS), attempts: 0, lastSentAt: new Date(now) },
+      { upsert: true, new: true }
+    );
+
+    await dispatchOtp(phone, code);
+
+    return res.status(201).json({
       success: true,
-      message: 'Registration submitted. Please complete payment to activate your application.',
-      freelancer: { id: freelancer._id, status: freelancer.status }
+      message: 'Application received. Please verify your phone to complete registration.',
+      dev: process.env.DEV_OTP === 'true' ? { code } : undefined,
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 };
 
+// ─── POST /freelancers/verify-otp ─────────────────────────────────────────────
 /**
- * @desc    Search freelancers
- * @route   GET /api/freelancers/search
- * @access  Public
+ * Step 2: Verify OTP for the freelancer's phone.
+ * On success: marks phoneVerified=true, creates/links a User record,
+ * returns a JWT. Status remains "pending" until admin approves.
  */
+exports.verifyOtp = async (req, res, next) => {
+  try {
+    const { phone, otp } = req.body;
+
+    if (!phone || !otp)
+      return res.status(400).json({ success: false, message: 'Phone and OTP are required.' });
+
+    const otpRecord = await Otp.findOne({ phone });
+
+    if (!otpRecord)
+      return res.status(400).json({ success: false, message: 'No OTP found. Please restart registration.' });
+
+    if (new Date() > otpRecord.expiresAt)
+      return res.status(400).json({ success: false, message: 'OTP expired. Please restart registration.' });
+
+    if (otpRecord.attempts >= MAX_ATTEMPTS)
+      return res.status(429).json({ success: false, message: 'Too many incorrect attempts. Please restart.' });
+
+    const valid = await otpRecord.verifyOtp(String(otp));
+    if (!valid) {
+      await Otp.findOneAndUpdate({ phone }, { $inc: { attempts: 1 } });
+      const rem = MAX_ATTEMPTS - (otpRecord.attempts + 1);
+      return res.status(400).json({
+        success: false,
+        message: `Invalid OTP. ${rem} attempt${rem !== 1 ? 's' : ''} remaining.`,
+      });
+    }
+
+    await Otp.deleteOne({ phone });
+
+    // Find the pending freelancer record
+    const freelancer = await Freelancer.findOne({ phone, phoneVerified: false });
+    if (!freelancer) {
+      return res.status(404).json({
+        success: false,
+        message: 'Freelancer application not found. Please re-submit the form.',
+      });
+    }
+
+    // Mark phone verified
+    freelancer.phoneVerified = true;
+    await freelancer.save();
+
+    // Create or retrieve User record with role:"freelancer"
+    let user = await User.findOne({ phone });
+    if (!user) {
+      user = await User.create({ phone, name: freelancer.name, role: 'freelancer' });
+    } else {
+      // Upgrade existing user role if needed
+      user.role = 'freelancer';
+      user.name = user.name || freelancer.name;
+      await user.save();
+    }
+
+    // Link freelancer → user
+    freelancer.user = user._id;
+    await freelancer.save();
+
+    user.lastLogin = new Date();
+    await user.save();
+
+    const token = signToken(user._id);
+
+    return res.json({
+      success: true,
+      message: 'Phone verified. Your application is under review.',
+      token,
+      user: {
+        id:    user._id,
+        phone: user.phone,
+        name:  user.name,
+        role:  user.role,
+      },
+      freelancer: {
+        id:     freelancer._id,
+        status: freelancer.status,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─── GET /freelancers/search ──────────────────────────────────────────────────
+
 exports.search = async (req, res, next) => {
   try {
     const {
       category,
-      lat,
-      lng,
-      radius = 20,
-      minPrice,
-      maxPrice,
+      lat, lng,
+      radius   = 20,
+      minPrice, maxPrice,
       minRating,
-      sortBy = 'ranking',
-      page = 1,
-      limit = 12
+      sortBy   = 'ranking',
+      page     = 1,
+      limit    = 12,
     } = req.query;
 
-    const filter = { status: 'approved' };
+    // Only approved, phone-verified freelancers appear in search
+    const filter = { status: 'approved', phoneVerified: true };
 
-    if (category) filter.primaryCategory = category;
+    if (category)  filter.primaryCategory = category;
     if (minPrice || maxPrice) {
       filter.priceAmount = {};
       if (minPrice) filter.priceAmount.$gte = parseFloat(minPrice);
@@ -103,183 +268,170 @@ exports.search = async (req, res, next) => {
     if (minRating) filter['stats.avgRating'] = { $gte: parseFloat(minRating) };
 
     let query;
-
-    // Geospatial search if coordinates provided
     if (lat && lng) {
       query = Freelancer.find({
         ...filter,
         location: {
           $near: {
             $geometry: { type: 'Point', coordinates: [parseFloat(lng), parseFloat(lat)] },
-            $maxDistance: parseFloat(radius) * 1000 // convert km to meters
-          }
-        }
+            $maxDistance: parseFloat(radius) * 1000,
+          },
+        },
       });
     } else {
       query = Freelancer.find(filter);
     }
 
-    // Sorting
-    const sortOptions = {
-      ranking: { 'stats.rankingScore': -1 },
-      rating: { 'stats.avgRating': -1 },
-      price_asc: { priceAmount: 1 },
-      price_desc: { priceAmount: -1 }
+    const sortMap = {
+      ranking:    { 'stats.rankingScore': -1 },
+      rating:     { 'stats.avgRating': -1 },
+      price_asc:  { priceAmount: 1 },
+      price_desc: { priceAmount: -1 },
     };
-    query = query.sort(sortOptions[sortBy] || sortOptions.ranking);
+    query = query.sort(sortMap[sortBy] || sortMap.ranking);
 
-    // Pagination
     const skip = (parseInt(page) - 1) * parseInt(limit);
-    query = query.skip(skip).limit(parseInt(limit));
+    query = query
+      .skip(skip)
+      .limit(parseInt(limit))
+      .populate('primaryCategory', 'name slug icon parentGroup')
+      .populate('secondaryCategories', 'name slug icon')
+      .select('-idProof');
 
     const [freelancers, total] = await Promise.all([
-      query
-        .populate('user', 'name phone location')
-        .populate('primaryCategory', 'name slug icon parentGroup'),
-      Freelancer.countDocuments(filter)
+      query,
+      Freelancer.countDocuments(filter),
     ]);
 
-    res.json({
+    return res.json({
       success: true,
       data: freelancers,
       pagination: {
         total,
-        page: parseInt(page),
+        page:  parseInt(page),
         pages: Math.ceil(total / parseInt(limit)),
-        limit: parseInt(limit)
-      }
+        limit: parseInt(limit),
+      },
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 };
 
-/**
- * @desc    Get single freelancer profile
- * @route   GET /api/freelancers/:id
- * @access  Public
- */
-exports.getProfile = async (req, res, next) => {
+// ─── GET /freelancers/top ─────────────────────────────────────────────────────
+
+exports.getTopFreelancers = async (req, res, next) => {
   try {
-    const freelancer = await Freelancer.findById(req.params.id)
-      .populate('user', 'name location')
-      .populate('primaryCategory', 'name slug icon parentGroup')
-      .populate('secondaryCategories', 'name slug icon');
+    const freelancers = await Freelancer.find({
+      status: 'approved',
+      phoneVerified: true,
+      isTopFreelancer: true,
+    })
+      .populate('primaryCategory', 'name slug icon')
+      .sort({ 'stats.rankingScore': -1 })
+      .limit(8)
+      .select('-idProof');
 
-    if (!freelancer || freelancer.status !== 'approved') {
-      return res.status(404).json({ success: false, message: 'Freelancer not found' });
-    }
-
-    // Increment views
-    await Freelancer.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
-
-    // Get reviews
-    const reviews = await Review.find({ freelancer: req.params.id, isVisible: true })
-      .populate('user', 'name avatar')
-      .sort({ createdAt: -1 })
-      .limit(10);
-
-    res.json({
-      success: true,
-      data: { ...freelancer.toObject(), reviews }
-    });
-  } catch (error) {
-    next(error);
+    return res.json({ success: true, data: freelancers });
+  } catch (err) {
+    next(err);
   }
 };
 
-/**
- * @desc    Get freelancer's own profile
- * @route   GET /api/freelancers/my-profile
- * @access  Private (freelancer)
- */
+// ─── GET /freelancers/my-profile ──────────────────────────────────────────────
+
 exports.getMyProfile = async (req, res, next) => {
   try {
     const freelancer = await Freelancer.findOne({ user: req.user._id })
       .populate('primaryCategory', 'name slug icon')
       .populate('secondaryCategories', 'name slug icon');
 
-    if (!freelancer) {
-      return res.status(404).json({ success: false, message: 'Freelancer profile not found' });
-    }
+    if (!freelancer)
+      return res.status(404).json({ success: false, message: 'Freelancer profile not found.' });
 
-    res.json({ success: true, data: freelancer });
-  } catch (error) {
-    next(error);
+    return res.json({ success: true, data: freelancer });
+  } catch (err) {
+    next(err);
   }
 };
 
-/**
- * @desc    Get masked phone for contact
- * @route   GET /api/freelancers/:id/contact
- * @access  Private (authenticated users)
- */
-exports.getContact = async (req, res, next) => {
+// ─── GET /freelancers/:id ─────────────────────────────────────────────────────
+
+exports.getProfile = async (req, res, next) => {
   try {
     const freelancer = await Freelancer.findById(req.params.id)
-      .populate('user', 'phone');
+      .populate('primaryCategory', 'name slug icon parentGroup')
+      .populate('secondaryCategories', 'name slug icon')
+      .select('-idProof');
 
     if (!freelancer || freelancer.status !== 'approved') {
-      return res.status(404).json({ success: false, message: 'Freelancer not found' });
+      return res.status(404).json({ success: false, message: 'Freelancer not found.' });
     }
 
-    const phone = freelancer.user.phone;
-    // Mask middle digits: +91XXXXX6789
+    await Freelancer.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
+
+    // Attach reviews
+    let reviews = [];
+    try {
+      reviews = await Review.find({ freelancer: req.params.id, isVisible: true })
+        .populate('user', 'name')
+        .sort({ createdAt: -1 })
+        .limit(10);
+    } catch (_) { /* Review model may not exist yet */ }
+
+    return res.json({ success: true, data: { ...freelancer.toObject(), reviews } });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─── GET /freelancers/:id/contact ─────────────────────────────────────────────
+
+exports.getContact = async (req, res, next) => {
+  try {
+    const freelancer = await Freelancer.findById(req.params.id).select('phone status relayPhone');
+
+    if (!freelancer || freelancer.status !== 'approved')
+      return res.status(404).json({ success: false, message: 'Freelancer not found.' });
+
+    const phone  = freelancer.phone;
     const masked = phone.slice(0, -7) + 'XXXXX' + phone.slice(-4);
 
-    res.json({
+    return res.json({
       success: true,
       data: {
         maskedPhone: masked,
-        // In production, this would go through a relay system
-        relayPhone: freelancer.relayPhone || phone
-      }
+        relayPhone:  freelancer.relayPhone || phone,
+      },
     });
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 };
 
-/**
- * @desc    Get top freelancers
- * @route   GET /api/freelancers/top
- * @access  Public
- */
-exports.getTopFreelancers = async (req, res, next) => {
-  try {
-    const freelancers = await Freelancer.find({
-      status: 'approved',
-      isTopFreelancer: true
-    })
-      .populate('user', 'name')
-      .populate('primaryCategory', 'name slug icon')
-      .sort({ 'stats.rankingScore': -1 })
-      .limit(8);
+// ─── PUT /freelancers/my-profile ──────────────────────────────────────────────
 
-    res.json({ success: true, data: freelancers });
-  } catch (error) {
-    next(error);
-  }
-};
-
-/**
- * @desc    Update freelancer profile
- * @route   PUT /api/freelancers/my-profile
- * @access  Private (freelancer)
- */
 exports.updateProfile = async (req, res, next) => {
   try {
-    const allowedFields = ['bio', 'skills', 'priceAmount', 'priceModel', 'priceConditions',
-      'serviceRadius', 'availability', 'location'];
+    const allowed = [
+      'bio', 'skills', 'priceAmount', 'priceModel',
+      'priceConditions', 'serviceRadius', 'availability', 'location',
+    ];
 
     const updates = {};
-    allowedFields.forEach(field => {
+    for (const field of allowed) {
       if (req.body[field] !== undefined) {
-        updates[field] = typeof req.body[field] === 'string' && field !== 'bio'
-          ? JSON.parse(req.body[field])
-          : req.body[field];
+        try {
+          updates[field] =
+            typeof req.body[field] === 'string' &&
+            ['skills', 'availability', 'location'].includes(field)
+              ? JSON.parse(req.body[field])
+              : req.body[field];
+        } catch {
+          updates[field] = req.body[field];
+        }
       }
-    });
+    }
 
     const freelancer = await Freelancer.findOneAndUpdate(
       { user: req.user._id },
@@ -287,8 +439,8 @@ exports.updateProfile = async (req, res, next) => {
       { new: true, runValidators: true }
     );
 
-    res.json({ success: true, data: freelancer });
-  } catch (error) {
-    next(error);
+    return res.json({ success: true, data: freelancer });
+  } catch (err) {
+    next(err);
   }
 };
